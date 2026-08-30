@@ -1,0 +1,552 @@
+```html
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>WebAR Shiva with Occlusion & Video Recorder</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <!-- A-Frame & MindAR -->
+    <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+    
+    <!-- MediaPipe Selfie Segmentation for Foreground Occlusion -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js" crossorigin="anonymous"></script>
+
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        font-family: Arial, sans-serif;
+      }
+
+      /* Scan Target Overlay */
+      #scanOverlay {
+        position: fixed;
+        top: 0; left: 0;
+        width: 100%; height: 100%;
+        background: rgba(0, 0, 0, 0.85);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        z-index: 9999;
+        transition: opacity 0.5s;
+      }
+
+      #scanOverlay.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .scan-container { text-align: center; max-width: 90%; }
+      .scan-title { color: white; font-size: 22px; margin-bottom: 20px; font-weight: 300; }
+      .target-preview {
+        position: relative;
+        width: 260px; height: 260px;
+        margin: 0 auto 15px;
+        border: 2px solid rgba(255,255,255,0.4);
+        border-radius: 12px;
+        overflow: hidden;
+      }
+      .target-image { width: 100%; height: 100%; object-fit: contain; opacity: 0.5; }
+      .scan-animation {
+        position: absolute; top: 0; left: 0; width: 100%; height: 3px;
+        background: #4CAF50; animation: scan 2s ease-in-out infinite;
+        box-shadow: 0 0 15px #4CAF50;
+      }
+      @keyframes scan { 0% { transform: translateY(0); } 50% { transform: translateY(257px); } 100% { transform: translateY(0); } }
+      .scan-instruction { color: rgba(255,255,255,0.8); font-size: 15px; }
+
+      /* Record Button & Timer */
+      #recordControls {
+        position: fixed;
+        bottom: 30px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        z-index: 10000;
+      }
+
+      #recBtn {
+        width: 68px;
+        height: 68px;
+        border-radius: 50%;
+        background: #ffffff;
+        border: 5px solid #ff4444;
+        cursor: pointer;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        outline: none;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.4);
+      }
+
+      #recInner {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        background: #ff4444;
+        transition: all 0.2s ease;
+      }
+
+      #recBtn.recording #recInner {
+        width: 24px;
+        height: 24px;
+        border-radius: 4px;
+      }
+
+      #recTimer {
+        color: #ffffff;
+        font-weight: bold;
+        font-size: 14px;
+        text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+      }
+
+      /* Person Foreground Canvas */
+      #personOcclusionCanvas {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 50;
+      }
+    </style>
+
+    <script>
+      // 1. Video Chroma/Luma Cut-Off
+      AFRAME.registerComponent('transparent-video', {
+        schema: {
+          src: { type: 'selector' },
+          threshold: { type: 'number', default: 0.88 }
+        },
+        init: function () {
+          const video = this.data.src;
+          const texture = new THREE.VideoTexture(video);
+          texture.minFilter = THREE.LinearFilter;
+          texture.magFilter = THREE.LinearFilter;
+          texture.format = THREE.RGBAFormat;
+
+          const material = new THREE.ShaderMaterial({
+            transparent: true,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+            uniforms: {
+              uTexture: { value: texture },
+              uThreshold: { value: this.data.threshold }
+            },
+            vertexShader: `
+              varying vec2 vUv;
+              void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              }
+            `,
+            fragmentShader: `
+              uniform sampler2D uTexture;
+              uniform float uThreshold;
+              varying vec2 vUv;
+              void main() {
+                vec4 color = texture2D(uTexture, vUv);
+                float brightness = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+                if (brightness > uThreshold) {
+                  discard;
+                } else {
+                  gl_FragColor = color;
+                }
+              }
+            `
+          });
+
+          const apply = () => {
+            const mesh = this.el.getObject3D('mesh');
+            if (mesh) mesh.material = material;
+          };
+          this.el.addEventListener('loaded', apply);
+          apply();
+        }
+      });
+
+      // 2. Flowing Mystical White Fog (Premultiplied Alpha prevents flat white circle in canvas 2D recording)
+      AFRAME.registerComponent('moving-fog', {
+        schema: { speed: { type: 'number', default: 0.45 } },
+        init: function () {
+          this.material = new THREE.ShaderMaterial({
+            transparent: true,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+            uniforms: { uTime: { value: 0.0 } },
+            vertexShader: `
+              varying vec2 vUv;
+              void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              }
+            `,
+            fragmentShader: `
+              uniform float uTime;
+              varying vec2 vUv;
+              vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+              vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+              vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
+
+              float snoise(vec2 v){
+                const vec4 C = vec4(0.211324865405187, 0.366025403784439, -0.577350269189626, 0.024390243902439);
+                vec2 i  = floor(v + dot(v, C.yy) );
+                vec2 x0 = v -   i + dot(i, C.xx);
+                vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+                vec4 x12 = x0.xyxy + C.xxzz;
+                x12.xy -= i1;
+                i = mod289(i);
+                vec3 p = permute( permute( i.y + vec3(0.0, i1.y, 1.0 )) + i.x + vec3(0.0, i1.x, 1.0 ));
+                vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+                m = m*m;
+                m = m*m;
+                vec3 x = 2.0 * fract(p * C.www) - 1.0;
+                vec3 h = abs(x) - 0.5;
+                vec3 ox = floor(x + 0.5);
+                vec3 a0 = x - ox;
+                m *= 1.79284291400159 - 0.85373472095314 * ( a0*a0 + h*h );
+                vec3 g;
+                g.x  = a0.x  * x0.x  + h.x  * x0.y;
+                g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+                return 130.0 * dot(m, g);
+              }
+
+              float fbm(vec2 uv) {
+                float value = 0.0;
+                float amp = 0.55;
+                for (int i = 0; i < 4; i++) {
+                  value += amp * snoise(uv);
+                  uv *= 2.1;
+                  amp *= 0.48;
+                }
+                return value;
+              }
+
+              void main() {
+                vec2 uv = vUv;
+                vec2 motion = vec2(uTime * 0.08, uTime * 0.15);
+                float cloud1 = fbm(uv * 3.0 + motion);
+                float cloud2 = fbm(uv * 4.5 - motion * 0.6);
+                float fog = (cloud1 + cloud2) * 0.5 + 0.5;
+
+                float dist = distance(uv, vec2(0.5, 0.5));
+                float edgeMask = smoothstep(0.55, 0.25, dist);
+                float solidCore = smoothstep(0.42, 0.15, dist);
+                float alpha = clamp(fog * 0.85 * edgeMask + solidCore * 0.95, 0.0, 1.0);
+
+                vec3 fogColor = mix(vec3(0.92, 0.94, 0.98), vec3(1.0, 1.0, 1.0), fog);
+                
+                // Premultiplied alpha prevents 2D canvas recorder washouts
+                gl_FragColor = vec4(fogColor * alpha, alpha);
+              }
+            `
+          });
+
+          const apply = () => {
+            const mesh = this.el.getObject3D('mesh');
+            if (mesh) mesh.material = this.material;
+          };
+          this.el.addEventListener('loaded', apply);
+          apply();
+        },
+        tick: function (time, timeDelta) {
+          if (this.material) {
+            this.material.uniforms.uTime.value += (timeDelta / 1000) * this.data.speed;
+          }
+        }
+      });
+    </script>
+  </head>
+  <body>
+
+    <!-- Scanner overlay -->
+    <div id="scanOverlay">
+      <div class="scan-container">
+        <h2 class="scan-title">Scan the Wall Drawing</h2>
+        <div class="target-preview">
+          <img id="previewImg" src="./assets/target_image.jpg" alt="Target" class="target-image">
+          <div class="scan-animation"></div>
+        </div>
+        <p class="scan-instruction">Point camera at the wall marker</p>
+      </div>
+    </div>
+
+    <!-- Foreground Person Occlusion Canvas -->
+    <canvas id="personOcclusionCanvas"></canvas>
+
+    <!-- Recording Controls -->
+    <div id="recordControls">
+      <div id="recTimer">00:00</div>
+      <button id="recBtn"><div id="recInner"></div></button>
+    </div>
+
+    <!-- MindAR Scene -->
+    <a-scene
+      mindar-image="imageTargetSrc: ./assets/targets.mind; filterMinCF: 0.0001; filterBeta: 0.001;"
+      vr-mode-ui="enabled: false"
+      device-orientation-permission-ui="enabled: true"
+      renderer="colorManagement: true; physicallyCorrectLights: true; preserveDrawingBuffer: true; antialias: true;">
+
+      <a-assets timeout="30000">
+        <video 
+          id="arVideo" 
+          src="./assets/model.mp4" 
+          preload="auto" 
+          loop="true" 
+          crossorigin="anonymous" 
+          playsinline 
+          webkit-playsinline>
+        </video>
+      </a-assets>
+
+      <a-camera position="0 0 0" look-controls="enabled: false"></a-camera>
+
+      <!-- Target Anchor -->
+      <a-entity id="targetAnchor" mindar-image-target="targetIndex: 0">
+        <!-- 1. Background Masking Smoke Plane -->
+        <a-plane
+          id="fogPlane"
+          position="0 0 -0.02"
+          width="3.2"
+          height="3.2"
+          moving-fog="speed: 0.45"
+          visible="false">
+        </a-plane>
+
+        <!-- 2. Transparent Lord Shiva Video Plane -->
+        <a-plane
+          id="videoPlane"
+          position="0 0 0.02"
+          width="1.1"
+          height="1.95"
+          transparent-video="src: #arVideo; threshold: 0.88"
+          visible="false">
+        </a-plane>
+      </a-entity>
+
+    </a-scene>
+
+    <script>
+      const scanOverlay     = document.getElementById('scanOverlay');
+      const previewImg      = document.getElementById('previewImg');
+      const videoPlane      = document.getElementById('videoPlane');
+      const fogPlane        = document.getElementById('fogPlane');
+      const videoEl         = document.getElementById('arVideo');
+      const targetAnchor    = document.getElementById('targetAnchor');
+      const recordControls  = document.getElementById('recordControls');
+      const recBtn          = document.getElementById('recBtn');
+      const recTimer        = document.getElementById('recTimer');
+      const personCanvas    = document.getElementById('personOcclusionCanvas');
+      const personCtx       = personCanvas.getContext('2d');
+
+      let isTargetFound = false;
+      let mediaRecorder;
+      let recordedChunks = [];
+      let recordInterval;
+      let secondsRecorded = 0;
+      let cameraVideoElement = null;
+
+      previewImg.onerror = () => { previewImg.style.display = 'none'; };
+
+      // ==========================================
+      // 1. Person Occlusion Setup (MediaPipe)
+      // ==========================================
+      const selfieSegmentation = new SelfieSegmentation({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+      });
+
+      selfieSegmentation.setOptions({
+        modelSelection: 1
+      });
+
+      selfieSegmentation.onResults((results) => {
+        if (!isTargetFound) {
+          personCtx.clearRect(0, 0, personCanvas.width, personCanvas.height);
+          return;
+        }
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.round(window.innerWidth * dpr);
+        const h = Math.round(window.innerHeight * dpr);
+
+        if (personCanvas.width !== w || personCanvas.height !== h) {
+          personCanvas.width = w;
+          personCanvas.height = h;
+        }
+
+        personCtx.save();
+        personCtx.clearRect(0, 0, w, h);
+        personCtx.drawImage(results.segmentationMask, 0, 0, w, h);
+        personCtx.globalCompositeOperation = 'source-in';
+        personCtx.drawImage(results.image, 0, 0, w, h);
+        personCtx.restore();
+      });
+
+      // Hook into MindAR's camera stream once loaded
+      const sceneEl = document.querySelector('a-scene');
+      sceneEl.addEventListener('renderstart', () => {
+        const video = document.querySelector('video:not(#arVideo)');
+        if (video) {
+          cameraVideoElement = video;
+          const sendFrame = async () => {
+            if (cameraVideoElement && cameraVideoElement.readyState >= 2) {
+              await selfieSegmentation.send({ image: cameraVideoElement });
+            }
+            requestAnimationFrame(sendFrame);
+          };
+          requestAnimationFrame(sendFrame);
+        }
+      });
+
+      // ==========================================
+      // 2. Target Detection Listeners
+      // ==========================================
+      targetAnchor.addEventListener('targetFound', () => {
+        isTargetFound = true;
+        scanOverlay.classList.add('hidden');
+        recordControls.style.display = 'flex';
+        fogPlane.setAttribute('visible', 'true');
+        videoPlane.setAttribute('visible', 'true');
+        
+        // Play video with audio unmuted by default
+        videoEl.muted = false;
+        videoEl.play().catch(() => {
+          videoEl.muted = true;
+          videoEl.play();
+        });
+      });
+
+      targetAnchor.addEventListener('targetLost', () => {
+        isTargetFound = false;
+        scanOverlay.classList.remove('hidden');
+        recordControls.style.display = 'none';
+        fogPlane.setAttribute('visible', 'false');
+        videoPlane.setAttribute('visible', 'false');
+        videoEl.pause();
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+          stopRecording();
+        }
+      });
+
+      // ==========================================
+      // 3. Composite Video Recording Engine
+      // ==========================================
+      const offscreenCanvas = document.createElement('canvas');
+      const offscreenCtx = offscreenCanvas.getContext('2d');
+
+      function startRecording() {
+        recordedChunks = [];
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.round(window.innerWidth * dpr);
+        const h = Math.round(window.innerHeight * dpr);
+
+        offscreenCanvas.width = w;
+        offscreenCanvas.height = h;
+
+        let animId;
+        const sceneCanvas = document.querySelector('a-scene').canvas;
+
+        const drawCompositeFrame = () => {
+          offscreenCtx.clearRect(0, 0, w, h);
+
+          // 1. Base Camera Feed
+          if (cameraVideoElement) {
+            offscreenCtx.drawImage(cameraVideoElement, 0, 0, w, h);
+          }
+          // 2. AR Scene (Fog + Lord Shiva)
+          if (sceneCanvas) {
+            offscreenCtx.drawImage(sceneCanvas, 0, 0, w, h);
+          }
+          // 3. Person Foreground
+          offscreenCtx.drawImage(personCanvas, 0, 0, w, h);
+
+          animId = requestAnimationFrame(drawCompositeFrame);
+        };
+        drawCompositeFrame();
+
+        const videoStream = offscreenCanvas.captureStream(60);
+
+        // Mix in audio from video
+        try {
+          const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const source = audioCtx.createMediaElementSource(videoEl);
+          const dest = audioCtx.createMediaStreamDestination();
+          source.connect(dest);
+          source.connect(audioCtx.destination);
+          
+          if (dest.stream.getAudioTracks().length > 0) {
+            videoStream.addTrack(dest.stream.getAudioTracks()[0]);
+          }
+        } catch (e) {
+          console.warn("Audio mixing fallback:", e);
+        }
+
+        let mime = 'video/mp4';
+        if (!MediaRecorder.isTypeSupported(mime)) {
+          mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+        }
+
+        mediaRecorder = new MediaRecorder(videoStream, { 
+          mimeType: mime,
+          videoBitsPerSecond: 12000000 // 12 Mbps for clear HD recording
+        });
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) recordedChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = () => {
+          cancelAnimationFrame(animId);
+          const blob = new Blob(recordedChunks, { type: mime });
+          const url = URL.createObjectURL(blob);
+          
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `shiva_blessing_ar_${Date.now()}.${mime.includes('mp4') ? 'mp4' : 'webm'}`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          window.URL.revokeObjectURL(url);
+        };
+
+        mediaRecorder.start();
+        recBtn.classList.add('recording');
+
+        secondsRecorded = 0;
+        recTimer.innerText = "00:00";
+        recordInterval = setInterval(() => {
+          secondsRecorded++;
+          const mins = String(Math.floor(secondsRecorded / 60)).padStart(2, '0');
+          const secs = String(secondsRecorded % 60).padStart(2, '0');
+          recTimer.innerText = `${mins}:${secs}`;
+        }, 1000);
+      }
+
+      function stopRecording() {
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+          mediaRecorder.stop();
+        }
+        clearInterval(recordInterval);
+        recBtn.classList.remove('recording');
+        recTimer.innerText = "00:00";
+      }
+
+      recBtn.addEventListener('click', () => {
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+          startRecording();
+        } else {
+          stopRecording();
+        }
+      });
+    </script>
+  </body>
+</html>
+
+```
